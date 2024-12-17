@@ -12,6 +12,7 @@
 #define NGX_SSL_CACHE_PATH    0
 #define NGX_SSL_CACHE_DATA    1
 #define NGX_SSL_CACHE_ENGINE  2
+#define NGX_SSL_CACHE_STORE   3
 
 
 typedef struct {
@@ -208,6 +209,11 @@ ngx_ssl_cache_init_key(ngx_pool_t *pool, ngx_uint_t index, ngx_str_t *path,
         && ngx_strncmp(path->data, "engine:", sizeof("engine:") - 1) == 0)
     {
         id->type = NGX_SSL_CACHE_ENGINE;
+
+    } else if (index == NGX_SSL_CACHE_PKEY
+        && ngx_strncmp(path->data, "store:", sizeof("store:") - 1) == 0)
+    {
+        id->type = NGX_SSL_CACHE_STORE;
 
     } else {
         if (ngx_get_full_name(pool, (ngx_str_t *) &ngx_cycle->conf_prefix, path)
@@ -443,6 +449,51 @@ ngx_ssl_cache_pkey_create(ngx_ssl_cache_key_t *id, char **err, void *data)
 #else
 
         *err = "loading \"engine:...\" certificate keys is not supported";
+        return NULL;
+
+#endif 
+    }
+
+    if (id->type == NGX_SSL_CACHE_STORE) {
+
+#ifdef ERR_LIB_OSSL_STORE
+
+        u_char           *uri;
+        OSSL_STORE_CTX   *store;
+        OSSL_STORE_INFO  *info;
+
+        uri = id->data + sizeof("store:") - 1;
+
+        store = OSSL_STORE_open((char *) uri, NULL, NULL, NULL, NULL);
+
+        if (store == NULL) {
+            *err = "OSSL_STORE_open() failed";
+            return NULL;
+        }
+
+        pkey = NULL;
+
+        while (pkey == NULL && !OSSL_STORE_eof(store)) {
+            info = OSSL_STORE_load(store);
+
+            if (info == NULL) {
+                continue;
+            }
+
+            if (OSSL_STORE_INFO_get_type(info) == OSSL_STORE_INFO_PKEY) {
+                pkey = OSSL_STORE_INFO_get1_PKEY(info);
+            }
+
+            OSSL_STORE_INFO_free(info);
+        }
+
+        OSSL_STORE_close(store);
+
+        return pkey;
+
+#else
+
+        *err = "loading \"store:...\" certificate keys is not supported";
         return NULL;
 
 #endif

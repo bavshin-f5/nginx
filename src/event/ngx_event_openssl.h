@@ -37,6 +37,9 @@
 #include <openssl/ocsp.h>
 #endif
 #include <openssl/rand.h>
+#ifdef ERR_LIB_OSSL_STORE
+#include <openssl/store.h>
+#endif
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
