@@ -114,6 +114,14 @@ static void *ngx_ssl_cache_ca_create(ngx_ssl_cache_key_t *id, char **err,
 
 static BIO *ngx_ssl_cache_create_bio(ngx_ssl_cache_key_t *id, char **err);
 
+#if ERR_R_OSSL_STORE_LIB
+
+static void* ngx_ssl_cache_create_store_cert(ngx_ssl_cache_key_t *id,
+    char **err, void *data, int sort);
+static int ngx_ssl_cache_sort_x509_chain(STACK_OF(X509) *chain);
+
+#endif
+
 static void *ngx_openssl_cache_create_conf(ngx_cycle_t *cycle);
 static char *ngx_openssl_cache_init_conf(ngx_cycle_t *cycle, void *conf);
 static void ngx_ssl_cache_cleanup(void *data);
@@ -465,7 +473,7 @@ ngx_ssl_cache_init_key(ngx_pool_t *pool, ngx_uint_t index, ngx_str_t *path,
     {
         id->type = NGX_SSL_CACHE_ENGINE;
 
-    } else if (index == NGX_SSL_CACHE_PKEY
+    } else if (index <= NGX_SSL_CACHE_PKEY
         && ngx_strncmp(path->data, "store:", sizeof("store:") - 1) == 0)
     {
         id->type = NGX_SSL_CACHE_STORE;
@@ -577,6 +585,20 @@ ngx_ssl_cache_cert_create(ngx_ssl_cache_key_t *id, char **err, void *data)
     X509            *x509;
     u_long           n;
     STACK_OF(X509)  *chain;
+
+    if (id->type == NGX_SSL_CACHE_STORE) {
+
+#ifdef ERR_R_OSSL_STORE_LIB
+
+        return ngx_ssl_cache_create_store_cert(id, err, data, 1);
+
+#else
+
+        *err = "loading \"store:...\" certificates is not supported";
+        return NULL;
+
+#endif
+    }
 
     chain = sk_X509_new_null();
     if (chain == NULL) {
@@ -802,7 +824,7 @@ ngx_ssl_cache_pkey_create(ngx_ssl_cache_key_t *id, char **err, void *data)
         }
 
         if (pkey == NULL) {
-            *err = "OSSL_STORE_load() failed";
+            *err = "OSSL_STORE_load() found no certificate keys";
             return NULL;
         }
 
@@ -1087,6 +1109,169 @@ ngx_ssl_cache_create_bio(ngx_ssl_cache_key_t *id, char **err)
 
     return bio;
 }
+
+
+#if ERR_R_OSSL_STORE_LIB
+
+static void*
+ngx_ssl_cache_create_store_cert(ngx_ssl_cache_key_t *id, char **err, void *data,
+    int sort)
+{
+    ngx_array_t  **passwords = data;
+
+    X509                 *x509;
+    u_char               *uri;
+    UI_METHOD            *method;
+    STACK_OF(X509)       *chain;
+    OSSL_STORE_CTX       *store;
+    OSSL_STORE_INFO      *info;
+    ngx_ssl_cache_pwd_t   cb_data, *pwd;
+
+    if (*passwords) {
+        cb_data.pwd = (*passwords)->elts;
+        pwd = &cb_data;
+        method = UI_UTIL_wrap_read_pem_callback(
+                                          ngx_ssl_cache_pkey_password_callback,
+                                          0);
+    } else {
+        cb_data.pwd = NULL;
+        pwd = NULL;
+        method = NULL;
+    }
+
+    uri = id->data + sizeof("store:") - 1;
+
+    chain = sk_X509_new_null();
+    if (chain == NULL) {
+        *err = "sk_X509_new_null() failed";
+        return NULL;
+    }
+
+    store = OSSL_STORE_open((char *) uri, method, pwd, NULL, NULL);
+
+    if (store == NULL) {
+        *err = "OSSL_STORE_open() failed";
+        goto failed;
+    }
+
+    while (!OSSL_STORE_eof(store)) {
+        info = OSSL_STORE_load(store);
+
+        if (info == NULL) {
+            continue;
+        }
+
+        if (OSSL_STORE_INFO_get_type(info) == OSSL_STORE_INFO_CERT) {
+            x509 = OSSL_STORE_INFO_get1_CERT(info);
+
+            if (x509 == NULL) {
+                *err = "OSSL_STORE_load() failed";
+                goto failed;
+            }
+
+            if (sk_X509_push(chain, x509) == 0) {
+                *err = "sk_X509_push() failed";
+                X509_free(x509);
+                goto failed;
+            }
+        }
+
+        OSSL_STORE_INFO_free(info);
+    }
+
+    OSSL_STORE_close(store);
+
+    if (method != NULL) {
+        UI_destroy_method(method);
+    }
+
+    if (sk_X509_num(chain) == 0) {
+        *err = "OSSL_STORE_load() found no certificates";
+        sk_X509_free(chain);
+        return NULL;
+    }
+
+    if (sort && ngx_ssl_cache_sort_x509_chain(chain) != NGX_OK) {
+        *err = "sorting certificate chain failed";
+        sk_X509_pop_free(chain, X509_free);
+        return NULL;
+    }
+
+    return chain;
+
+failed:
+
+    if (store != NULL) {
+        OSSL_STORE_close(store);
+    }
+
+    if (method != NULL) {
+        UI_destroy_method(method);
+    }
+
+    sk_X509_pop_free(chain, X509_free);
+
+    return NULL;
+}
+
+
+static int
+ngx_ssl_cache_sort_x509_chain(STACK_OF(X509) *chain)
+{
+    int         i, j;
+    X509       *a, *b;
+    X509_NAME  *issuer;
+
+    for (i = sk_X509_num(chain) - 1; i >=0; --i) {
+next:
+        a = sk_X509_value(chain, i);
+        issuer = X509_get_issuer_name(a);
+
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+        {
+        int  n;
+
+        n = X509_self_signed(a, 1);
+
+        if (n == 1) {
+            continue;
+
+        } else if (n == -1) {
+            return NGX_ERROR;
+        }
+        }
+#else
+
+        if (issuer == NULL
+            || X509_NAME_cmp(X509_get_subject_name(a), issuer) == 0)
+        {
+            continue;
+        }
+
+#endif
+
+        /* Move certificate before its issuer */
+
+        for (j = i - 1; j >= 0; --j) {
+            b = sk_X509_value(chain, j);
+
+            if (X509_NAME_cmp(issuer, X509_get_subject_name(b)) == 0) {
+                a = sk_X509_delete(chain, i);
+
+                if (sk_X509_insert(chain, a, j) == 0) {
+                    X509_free(a);
+                    return NGX_ERROR;
+                }
+
+                goto next;
+            }
+        }
+    }
+
+    return NGX_OK;
+}
+
+#endif
 
 
 static void *
