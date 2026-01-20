@@ -488,7 +488,7 @@ ngx_ssl_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
 retry:
 
     chain = ngx_ssl_cache_fetch(cf, NGX_SSL_CACHE_CERT | mask,
-                                &err, cert, NULL);
+                                &err, cert, passwords);
     if (chain == NULL) {
         if (err != NULL) {
             ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
@@ -650,7 +650,7 @@ retry:
 
     chain = ngx_ssl_cache_connection_fetch(cache, pool,
                                            NGX_SSL_CACHE_CERT | mask,
-                                           &err, cert, NULL);
+                                           &err, cert, passwords);
     if (chain == NULL) {
         if (err != NULL) {
             ngx_ssl_error(NGX_LOG_ERR, c->log, 0,
